@@ -1,0 +1,13 @@
+{
+  "bRemoveDirt": true,
+  "bRemovePaint": true,
+  "bRemoveScarsGashes": true,
+  "bRemoveTattoo": true,
+  "bLogOnly": false,
+  "Mods": [
+    {
+      "modFilename": "PAN_Nameless - Witches.esp",
+      "modFilepath": "L:\\SkyrimMods64\\PAN_Nameless Witches SE - esl-130245-1-0-1727393584"
+    }
+  ]
+}
