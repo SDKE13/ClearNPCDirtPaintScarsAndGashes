@@ -8,6 +8,14 @@ using System.Text;
 using Reloaded.Memory.Utilities;
 using Mutagen.Bethesda.Plugins.Binary.Parameters;
 using System.Linq;
+using CommandLine;
+using Serilog;
+using Serilog.Sinks.File;
+using Serilog.Sinks.SystemConsole;
+using Serilog.Core;
+using ClearNPCDirtPaintScarsAndGashes.Models;
+using ClearNPCDirtPaintScarsAndGashes.Common;
+using System.Collections.Generic;
 
 namespace ClearNPCDirtPaintScarsAndGashes
 {
@@ -49,8 +57,25 @@ namespace ClearNPCDirtPaintScarsAndGashes
 
     public class Program
     {
-        
+        internal static Logger _logger;
+        internal static LoggingLevelSwitch _logLevel;
+        internal static DateTime timeStamp;
         static Lazy<ConfigSettings>? Settings = null;
+
+        static Program()
+        {
+            timeStamp = DateTime.Now;
+            _logLevel = new LoggingLevelSwitch();
+            _logLevel.MinimumLevel = Serilog.Events.LogEventLevel.Verbose;
+
+            _logger = new LoggerConfiguration()
+                .WriteTo.Console(outputTemplate: "{Timestamp:yyyy-MM-dd hh:mm:ss } [{SourceContext}] [{Level:u3}] {Message:lj}{NewLine}{Exception}")
+                .WriteTo.File(path: $"log_{timeStamp.ToString("yyyyMMddhhmmss")}.txt", 
+                    outputTemplate: "{Timestamp:yyyy-MM-dd hh:mm:ss} [{SourceContext}] [{Level:u3}] {Message:lj}{NewLine}{Exception}")
+                .MinimumLevel.ControlledBy(_logLevel)                    
+                .CreateLogger();
+            _logger = (Logger)_logger.ForContext<Program>();
+        }
         public static async Task<int> Main(string[] args)
         {
             return await SynthesisPipeline.Instance
@@ -84,11 +109,16 @@ namespace ClearNPCDirtPaintScarsAndGashes
                 string babesEsp = mod.modFilename;
                 string babesMeshPath = mod.modFilepath;
 
-                System.Console.WriteLine($"Processing {babesEsp}");
-                System.Console.WriteLine($"Path {babesMeshPath}");
-                System.Console.WriteLine($"");
+                _logger.Verbose($"Processing {babesEsp}");
+                _logger.Verbose($"Path {babesMeshPath}");
+                if(Settings.Value.bLogOnly)
+                {
+                    _logger.Verbose($"Patcher set to LogOnly");   
+                }
+                _logger.Verbose($"");
                 ProcessMod(babesEsp, babesMeshPath, state, Settings.Value);
-            }
+            }    
+            
         }
 
         private static bool ProcessMod(string modFilename, string modFilepath,  IPatcherState<ISkyrimMod, ISkyrimModGetter> state, ConfigSettings Settings )
@@ -102,23 +132,36 @@ namespace ClearNPCDirtPaintScarsAndGashes
             try
             {
                 babesOverlay = SkyrimMod.CreateFromBinary(babesEspPath, SkyrimRelease.SkyrimSE);
+                RemoveCompressionFlags(babesOverlay);
+
             }
             catch (Exception ex)
             {
-                System.Console.WriteLine(ex.Source);
-                System.Console.WriteLine(ex.Message);
-                System.Console.WriteLine(ex.StackTrace);
+                _logger.Error("EXCEPTION!!", ex);
+                
                 return false;
             }
             
             System.IO.Directory.CreateDirectory(System.IO.Path.Combine(babesMeshPath, "temp"));
 
-            Dictionary<FormKey, List<ushort>> raceTintmasks = new Dictionary<FormKey, List<ushort>>();
+            Dictionary<FormKey, RaceTintMask> raceTintmasks = new Dictionary<FormKey, RaceTintMask>();
+            RaceTintMask? raceMask;
+            int tempCount;
+
             List<string> validScarsGashes = new List<string>() { "NoScar", "NoGash" };
             using (var cache = state.LoadOrder.PriorityOrder.ToImmutableLinkCache())
             {
                 foreach (var tempNPC in babesOverlay.Npcs)
                 {
+                    StringBuilder sbRemoved = new StringBuilder();
+                    sbRemoved.Clear();
+
+                    if(tempNPC.SkyrimMajorRecordFlags.HasFlag(SkyrimMajorRecord.SkyrimMajorRecordFlag.Deleted))
+                    {
+                        _logger.Verbose($"{(tempNPC.Configuration.Flags.HasFlag(NpcConfiguration.Flag.Female) ? "Female" : "Male")}> {tempNPC.Name?.ToString() ?? string.Empty} :: {tempNPC.EditorID?.ToString() ?? string.Empty} | {tempNPC.FormKey.ToString()}");
+                        _logger.Verbose($"Has Deleted flag");
+                        continue;
+                    }
                     var r = tempNPC.Race.Resolve(cache);
 
                     if (r == null)
@@ -126,63 +169,69 @@ namespace ClearNPCDirtPaintScarsAndGashes
                         continue;
                     }
 
-                    System.Console.WriteLine($"{(tempNPC.Configuration.Flags.HasFlag(NpcConfiguration.Flag.Female) ? "Female" : "Male")}> {tempNPC.Name?.ToString() ?? string.Empty} :: {tempNPC.EditorID?.ToString() ?? string.Empty} | {tempNPC.FormKey.ToString()}");
+                    _logger.Verbose($"{(tempNPC.Configuration.Flags.HasFlag(NpcConfiguration.Flag.Female) ? "Female" : "Male")}> {tempNPC.Name?.ToString() ?? string.Empty} :: {tempNPC.EditorID?.ToString() ?? string.Empty} | {tempNPC.FormKey.ToString()}");
 
-                    if (Settings.bRemoveDirt || Settings.bRemovePaint)
+                    if(!raceTintmasks.TryGetValue(r.FormKey, out raceMask))
                     {
-                        if (!raceTintmasks.ContainsKey(r.FormKey))
-                        {
-                            var t = r.HeadData?.Female?.TintMasks ?? null;
-                            if (t == null)
-                            {
-                                continue;
-                            }
+                        raceMask = new RaceTintMask(r);
+                        raceTintmasks.Add(r.FormKey, raceMask);
 
-                            if (Settings.bRemoveDirt)
-                            {
-                                var dirtIndexs = t.Where(a => (a.MaskType ?? TintAssets.TintMaskType.None) == TintAssets.TintMaskType.Dirt).Select(s => s.Index ?? 0);
-                                raceTintmasks.Add(r.FormKey, dirtIndexs.ToList<ushort>());
-                                if (dirtIndexs.Count() > 0)
-                                {
-                                    System.Console.Write("Removed dirt: ");
-                                    bModUpdated = true;
-                                }
-                            }
-                            if (Settings.bRemovePaint)
-                            {
-                                var paintIndexs = t.Where(a => (a.MaskType ?? TintAssets.TintMaskType.None) == TintAssets.TintMaskType.Paint).Select(s => s.Index ?? 0);
-                                raceTintmasks[r.FormKey].AddRange(paintIndexs.ToList<ushort>());
-                                if (paintIndexs.Count() > 0)
-                                {
-                                    System.Console.Write("Removed paint: ");
-                                    bModUpdated = true;
-                                }
-                            }
-                            if (Settings.bRemoveTattoo)
-                            {
-                                var tattooIndexs = t.Where(a =>
-                                {
-                                    return (a.FileName?.ToString() ?? string.Empty).Contains("Tattoo", StringComparison.InvariantCultureIgnoreCase);
-                                }).Select(s => s.Index ?? 0); ;
-                                raceTintmasks[r.FormKey].AddRange(tattooIndexs.ToList<ushort>());
-                                if (tattooIndexs.Count() > 0)
-                                {
-                                    System.Console.Write("Removed tattoo: ");
-                                    bModUpdated = true;
-                                }
-                            }
+                    }
+
+                    Dictionary<TintType, List<ushort>> genderTintMasks;
+
+                    if (tempNPC.Configuration.Flags.HasFlag(NpcConfiguration.Flag.Female))
+                    {
+                        genderTintMasks = raceMask.femaleRaceTintmasks;
+                    }
+                    else
+                    {
+                        genderTintMasks = raceMask.maleRaceTintmasks;
+                    }
+
+                    if(Settings.bRemoveDirt)
+                    {
+                        tempCount = tempNPC.TintLayers.Count;
+
+                        tempNPC.TintLayers.RemoveWhere(rm =>
+                        {
+                            return genderTintMasks[TintType.Dirt].Contains(rm.Index ?? 0);
+                        });
+                     
+                        if(tempCount != tempNPC.TintLayers.Count)
+                        {
+                            bModUpdated = true;
+                            sbRemoved.Append("Removed dirt: ");
                         }
+                    }
 
-                        foreach (var layer in tempNPC.TintLayers)
+                    if (Settings.bRemovePaint)
+                    {
+                        tempCount = tempNPC.TintLayers.Count;
+
+                        tempNPC.TintLayers.RemoveWhere(rm =>
                         {
-                            if (layer == null)
-                            {
-                                continue;
-                            }
-                            if (raceTintmasks[r.FormKey].Contains(layer.Index ?? 0))
-                            {
-                                layer.InterpolationValue = 0;
-                            }
+                            return genderTintMasks[TintType.Paint].Contains(rm.Index ?? 0);
+                        });
+                        if (tempCount != tempNPC.TintLayers.Count)
+                        {
+                            bModUpdated = true;
+                            sbRemoved.Append("Removed paint: ");
+                        }
+                    }
+
+                    if (Settings.bRemoveTattoo)
+                    {
+                        tempCount = tempNPC.TintLayers.Count;
+
+                        tempNPC.TintLayers.RemoveWhere(rm =>
+                        {
+                            return genderTintMasks[TintType.Tattoo].Contains(rm.Index ?? 0);
+                        });
+                        if (tempCount != tempNPC.TintLayers.Count)
+                        {
+                            bModUpdated = true;
+                            sbRemoved.Append("Removed tattoo: ");
                         }
                     }
 
@@ -228,27 +277,36 @@ namespace ClearNPCDirtPaintScarsAndGashes
 
                         if (bRemovedScars)
                         {
-                            System.Console.Write("Removed scars: ");
+                            sbRemoved.Append("Removed scars: ");
                             bModUpdated = true;
                         }
                     }
-                    System.Console.WriteLine(string.Empty);
+                    if (sbRemoved.Length > 0)
+                    {
+                        _logger.Verbose(sbRemoved.ToString());
+                    }
+                    _logger.Verbose(string.Empty);
                 }
             }
 
             state.Dispose();
 
+            StringBuilder logOutput = new StringBuilder();
+
             if (!Settings.bLogOnly && bModUpdated)
             {
-                System.Console.Write("Back up original file:");
+                logOutput.Append("Back up original file:");
                 if (!BackUpOriginalMod(System.IO.Path.Combine(modFilepath, modFilename)))
                 {
-                    System.Console.WriteLine("> Save error, can not continue.");
+                    logOutput.Append("> Save error, can not continue.");
+                    _logger.Error(logOutput.ToString());
                     return false;
                 }
-                System.Console.WriteLine("> Done");
+                logOutput.Append("> Done");
+                _logger.Verbose(logOutput.ToString());
 
-                System.Console.Write("Saving mod:");
+                logOutput.Clear();
+                logOutput.Append("Saving mod:");
 
                 try
                 {
@@ -260,21 +318,31 @@ namespace ClearNPCDirtPaintScarsAndGashes
                             FormIDUniqueness = FormIDUniquenessOption.Iterate
                         });
 
-                    System.Console.WriteLine("> Done");
+                    logOutput.Append("> Done");
 
-                    System.Console.WriteLine(string.Empty);
-                    System.Console.WriteLine(string.Empty);
+                    _logger.Verbose(logOutput.ToString());
+                    _logger.Verbose(string.Empty);
 
                     return true;
                 }
                 catch (Exception ex)
                 {
-                    System.Console.WriteLine(ex.Source);
-                    System.Console.WriteLine(ex.Message);
-                    System.Console.WriteLine(ex.StackTrace);
-
+                    _logger.Error(ex, "EXCEPTION!!");                    
                     return false;
                 }
+            }
+            else
+            {
+                if(!bModUpdated)
+                {
+                    _logger.Verbose($"Update skipped, no changes made");
+                }
+                else
+                {
+                    _logger.Verbose($"Update skipped, mod set to LogOnly");
+                }
+                
+                return true;
             }
 
             return false;
@@ -284,7 +352,7 @@ namespace ClearNPCDirtPaintScarsAndGashes
         {
             string modFilename = System.IO.Path.GetFileName(OriginalModPath);
             string modPath = System.IO.Path.GetDirectoryName(OriginalModPath) ?? string.Empty;
-            string dateSuffix = DateTime.Now.ToString("yyyyMMddhhmmss");
+            string dateSuffix = timeStamp.ToString("yyyyMMddhhmmss");
             string backSuffix = "_bak";
             string backUpFilename = $"{modFilename}{backSuffix}_{dateSuffix}";
 
@@ -296,10 +364,8 @@ namespace ClearNPCDirtPaintScarsAndGashes
             }
             catch (Exception ex)
             {
-                System.Console.WriteLine("EXCEPTION!!");
-                System.Console.WriteLine(ex?.Source ?? string.Empty);
-                System.Console.WriteLine(ex?.Message ?? string.Empty);
-                System.Console.WriteLine(ex?.StackTrace ?? string.Empty);
+                _logger.Error("EXCEPTION!!", ex);
+                
                 return false;
             }
 
@@ -330,8 +396,30 @@ namespace ClearNPCDirtPaintScarsAndGashes
                     if (hasScarGash.Exists(s => shapeName.Contains(s, StringComparison.InvariantCultureIgnoreCase)) &&
                         !validScarsGashes.Exists(s2 => shapeName.Contains(s2, StringComparison.InvariantCultureIgnoreCase)))
                     {
-                        nf.DeleteShape(shape);
-                        doSave = true;
+                        bool isHair = false;
+
+                        if (shape.HasSkinInstance())
+                        {                            
+                            var skinInstanceRef = shape.SkinInstanceRef();
+                            //NiSkinInstance? nsi = nf.GetHeader()?.GetBlockById(skinInstanceRef.index) as NiSkinInstance;
+                            //if (nsi != null)
+                            //{
+                                
+                            //}
+
+                            BSDismemberSkinInstance? bdsi = nf.GetHeader()?.GetBlockById(skinInstanceRef.index) as BSDismemberSkinInstance;                            
+                            
+                            if (bdsi != null)
+                            {
+                              isHair = true;                                
+                            }
+                        }
+
+                        if (!isHair)
+                        {
+                            nf.DeleteShape(shape);
+                            doSave = true;
+                        }
                     }
                 }
 
@@ -344,5 +432,22 @@ namespace ClearNPCDirtPaintScarsAndGashes
 
             return false;
         }
+
+        static internal void RemoveCompressionFlags(SkyrimMod overLay)
+        {
+            int count = 0;
+
+            foreach(var record in overLay.EnumerateMajorRecords())
+            {
+                if (record.IsCompressed)
+                {
+                    count += 1;
+                    record.IsCompressed = false;
+                    _logger.Verbose($"{record.EditorID?.ToString() ?? string.Empty} is compressed");
+                }
+            }
+        }
+
+      
     }
 }
